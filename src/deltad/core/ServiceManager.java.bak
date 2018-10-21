@@ -1,0 +1,593 @@
+package rdi.common;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.FilenameFilter;
+import java.io.IOException;
+import java.io.Writer;
+import java.lang.reflect.Constructor;
+import java.sql.PreparedStatement;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+import javax.jms.ConnectionFactory;
+
+import org.apache.activemq.ActiveMQConnectionFactory;
+import org.apache.log4j.Logger;
+import org.hibernate.SQLQuery;
+import org.hibernate.StatelessSession;
+
+import rdi.common.description.MirroringDescription;
+import rdi.common.description.MirroringModule;
+import rdi.common.dsm.DataSourceManager;
+import rdi.common.mcm.MailConfigureManager;
+import rdi.common.scheduling.DeployingPlanExecutor;
+
+
+public class ServiceManager extends AbstractMBeanSupport implements ServiceManagerMBean {
+	private static final Logger logger = Logger.getLogger(ServiceManager.class.getName());
+	public static final String SERVICE_MODULE_FILE_EXT = ".xml";
+	public static final String RDI_PLAN_SCRIPT_FILE_EXT = ".rps";
+	public static final String LOGQUEUESUFFIX = "_latest_scn";
+
+	public static String SERVICE_MANAGER_OBJECT_NAME = RDIAgent.AGENT_DOMAIN_NAME + "type=ServiceManager,name=singleton";
+
+	protected final Map<String, MirroringModule> modules = new HashMap<String, MirroringModule>();
+	protected final Map<String, RDIService> mserviceMap = new HashMap<String, RDIService>();
+
+	protected final Map<String, DeployingPlanExecutor> planMap = new HashMap<String, DeployingPlanExecutor>();
+
+	protected ServiceMonitor monitor = null;
+	protected final ScheduledExecutorService scheduler = new ScheduledThreadPoolExecutor(1);
+
+	protected final ScheduledExecutorService planScheduler = new ScheduledThreadPoolExecutor(8);
+
+	public ServiceManager() throws Exception {
+		super(SERVICE_MANAGER_OBJECT_NAME);
+		//loadModules();
+		registerMBean();
+		MailConfigureManager.getInstance();
+		// -----------------------------------------------------------------
+		monitor = ServiceMonitor.getInstance(mserviceMap, modules, this);
+		monitor.registerServiceStateListener(new DefaultServiceEventListener(MailConfigureManager.getInstance()));
+		scheduler.scheduleWithFixedDelay(monitor, -1, 10, TimeUnit.SECONDS);
+	}
+
+	@Override
+	public void schedulePlan(String planname, String scripts) throws Exception {
+		logger.info("deploying plan: " + planname);
+		DeployingPlanExecutor plan = new DeployingPlanExecutor(this, planname, null, scripts);
+		schedulePlan(planname, plan);
+
+		// do NOT write as file anymore
+		/*
+		String fileName = planname.endsWith(SERVICE_MODULE_FILE_EXT) ? planname : planname + RDI_PLAN_SCRIPT_FILE_EXT;
+		Writer writer = new FileWriter(RDIAgent.RDI_DEPLOY_DIR + fileName);
+		writer.write(scripts);
+		writer.close();
+		*/
+	}
+
+	@Override
+	public void schedulePlanForName(String planname) throws Exception {
+		logger.info("deploying plan: " + planname);
+		String fileName = planname.endsWith(SERVICE_MODULE_FILE_EXT) ? planname : planname + RDI_PLAN_SCRIPT_FILE_EXT;
+		DeployingPlanExecutor plan = new DeployingPlanExecutor(this, planname, null, new File(RDIAgent.RDI_DEPLOY_DIR + fileName));
+		schedulePlan(planname, plan);
+	}
+
+	private void schedulePlan(String name, DeployingPlanExecutor plan) {
+		if (planMap.containsKey(name))
+			throw new RuntimeException(String.format("plan with name %s already scheduled", name));
+		
+		plan.schedule(planScheduler);
+		this.planMap.put(plan.getName(), plan);
+	}
+	
+	@Override
+	public boolean cancelPlan(String name) {
+		DeployingPlanExecutor plan = planMap.remove(name);
+		if (null == plan)
+			return true;
+		
+		plan.stop();
+		
+		ScheduledFuture<String> scheduledFuture = plan.getFuture();
+		if (null == scheduledFuture)
+			return true;
+		
+		return scheduledFuture.cancel(true);
+	}
+	
+	@Override
+	public String[] getPlanNames() {
+		return this.planMap.keySet().toArray(new String[planMap.size()]);
+	}
+	
+	@Override
+	public Properties getPlanContext(String planName) {
+		DeployingPlanExecutor exe = planMap.get(planName);
+		return exe.getContext();
+	}
+	
+	@Override
+	public String[] getPlanResult(String planName) throws Exception {
+		DeployingPlanExecutor exe = planMap.get(planName);
+		return exe == null ? null : exe.getResult();
+	}
+	
+	@Override
+	public String[] getPlanScripts(String planName) {
+		DeployingPlanExecutor exe = planMap.get(planName);
+		return exe == null ? null : exe.getScripts();
+	}
+	
+	@Override
+	public void deploy(String xml, String type) throws Exception {
+		deploy(xml, RDIServiceType.valueOf(type));
+	}
+	
+	public void deploy(String xml, RDIServiceType type) throws Exception {		
+		MirroringModule module = upload(xml);
+		deploy(module, type);
+	}
+	
+	public MirroringModule upload(String xml) throws Exception {
+		MirroringModule module =  MirroringModule.fromXML(xml);
+		String name = module.getName();
+		logger.info("uploading module: " + name);
+		String moduleName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+		File moduleFile = new File(RDIAgent.RDI_DEPLOY_DIR + moduleName);
+		Writer writer = new FileWriter(moduleFile);
+		try {
+			writer.write(module.toXML());
+		} catch (Exception e) {
+			throw e;
+		} finally {
+			writer.close();
+		}
+		return module;
+	}
+	
+	private void deploy(MirroringModule module, RDIServiceType type) throws Exception {
+		String name = module.getName();
+		logger.info("deploying module: " + name);
+		String moduleName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+		if (modules.containsKey(moduleName)) {
+			throw new RuntimeException("a module with the same name already deployed");
+		}
+		if (RDIServiceType.SOURCE == type) {
+			//source additions
+			String srcds = module.getDataSourceName();
+			if (DatabaseType.SQLSERVER.equals(DataSourceManager.getInstance().getDatabaseType(srcds))) {
+				setupCDC(module);
+			}
+
+			String agentID = RDIAgent.getInstance().getAgentProperty("agent.name");
+			remove_md_filters(agentID, moduleName, module.getDataSourceName());
+			seed_md_filters(agentID, moduleName, module);
+			logger.info("seed_md_filters OK " + moduleName);	
+		}
+		module.setProperty(MirroringModule.SERVICE_TYPE, type.toString());
+		this.modules.put(moduleName, module);		
+		logger.info("deployed module OK " + module.getName());
+	}
+	
+	@Override
+	public void deployForName(String name, String type) throws Exception {
+		deployForName(name, RDIServiceType.valueOf(type.toUpperCase()));
+	}
+	
+	public void deployForName(String name, RDIServiceType type) throws Exception {
+		String fileName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+		StringBuffer buffer = new StringBuffer();
+		java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(RDIAgent.RDI_DEPLOY_DIR + fileName));
+		String line = reader.readLine();
+		while (null != line) {
+			buffer.append(line).append("\n");
+			line = reader.readLine();
+		}
+		MirroringModule module =  MirroringModule.fromXML(buffer.toString());
+		deploy(module, type);
+	}
+
+	@Override	
+	public void undeploy(String name) throws Exception {
+		logger.info("undeploying module: " + name);
+		String moduleName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+			
+		MirroringService service = mserviceMap.get(moduleName);
+		if (null != service && service.getState() != ServiceState.STOPPED) {
+			throw new IllegalStateException(String.format("service %s is still active, shut it down first.", service.getServiceName()));
+		}
+		
+		MirroringModule mm = modules.get(moduleName);
+		if (null == mm)
+			return;
+		
+		String type = mm.getProperty(MirroringModule.SERVICE_TYPE);
+		RDIServiceType serviceType = RDIServiceType.valueOf(type.toUpperCase());
+		if (RDIServiceType.TARGET.equals(serviceType)) {
+			removeServiceLog(mm);
+			
+		} else if (RDIServiceType.SOURCE.equals(serviceType)) {
+			String agentID = RDIAgent.getInstance().getAgentProperty("agent.name");
+			remove_md_filters(agentID, moduleName, mm.getDataSourceName());
+			logger.info("remove rdi_md_filters OK " + moduleName);
+			
+			String srcds = mm.getDataSourceName();
+			if (DatabaseType.SQLSERVER.equals(DataSourceManager.getInstance().getDatabaseType(srcds))) {
+				disableCDC(mm);
+			}
+			//purge from source side, do not purger from target
+			purgeQueue(mm.getName());
+			purgeQueue(mm.getName() + LOGQUEUESUFFIX);
+			logger.info("purgeQueue OK " + mm.getName());
+		}
+		
+		File module = new File(RDIAgent.RDI_DEPLOY_DIR + moduleName);
+		if (module.exists()) {
+			module.delete();
+		}
+		
+		this.mserviceMap.remove(moduleName);
+		this.modules.remove(moduleName);
+		logger.info("undeployed module " + mm.getName());
+	}
+
+	public static final String SOURCE_MIRRORINGSERVICE_CLASS = "rdi.source.MirroringService";
+	public static final String TARGET_MIRRORINGSERVICE_CLASS = "rdi.target.MirroringService";
+
+	public MirroringService submitMirroringService(MirroringModule module, RDIServiceType type) throws Exception {
+		module.consolidate();
+		// reflect
+		MirroringService service;
+		Class<?> claz;
+		if (RDIServiceType.SOURCE == type) {
+			claz = Thread.currentThread().getContextClassLoader().loadClass(SOURCE_MIRRORINGSERVICE_CLASS);
+		} else if (RDIServiceType.TARGET == type) {
+			claz = Thread.currentThread().getContextClassLoader().loadClass(TARGET_MIRRORINGSERVICE_CLASS);
+		} else {
+			throw new IllegalArgumentException("invalid service type " + type);
+		}
+		
+		String url = module.getProperty(MirroringModule.ASSOCIATED_MQ_URL);
+		String user = module.getProperty(MirroringModule.ASSOCIATED_MQ_USERNAME);
+		String password = module.getProperty(MirroringModule.ASSOCIATED_MQ_PASSWORD);
+		ConnectionFactory connectionFactory = new ActiveMQConnectionFactory(user, password, url);
+
+		Constructor<?> constructor = claz.getDeclaredConstructor(new Class[] { javax.jms.Connection.class, String.class, MirroringModule.class });
+		service = (MirroringService) constructor.newInstance(new Object[] { connectionFactory.createConnection(), RDIAgent.AGENT_DOMAIN_NAME + "type=MirroringService,serviceName=" + module.getName(), module });
+		logger.info("submit a module : " + module.getName());
+		logger.debug("submitMirroringService: \n" + module.toXML());
+
+		//service.start(clean);
+		String name = service.getMirroringModule().getName();
+		String moduleName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+		mserviceMap.put(moduleName, service);
+		return service;
+	}
+
+	@Override
+	public void startModule(String name, boolean clean) throws Exception {
+		String moduleName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+		MirroringModule module = this.modules.get(moduleName);
+		if (null == module)
+			return;
+		
+		String type = module.getProperty(MirroringModule.SERVICE_TYPE);
+		RDIServiceType serviceType = RDIServiceType.valueOf(type.toUpperCase());
+		MirroringService service = submitMirroringService(module, serviceType);
+		if (null != service)
+			service.start(clean);	
+	}
+	
+	@Override
+	public MirroringService getService(String moduleName) {
+		return this.mserviceMap.get(moduleName);
+	}
+
+	public void removeService(String name) {
+		String moduleName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+		this.mserviceMap.remove(moduleName);
+	}
+
+	@Override
+	public boolean started(String name) {
+		String moduleName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+		return getService(moduleName) != null;
+	}
+
+	@Override
+	public String displayModule(String key) {
+		if (!key.endsWith(SERVICE_MODULE_FILE_EXT))
+			key = key + SERVICE_MODULE_FILE_EXT;
+		MirroringModule module = modules.get(key);
+		return module == null ? null : module.toXML();
+	}
+
+	@Override
+	public String[] getModuleNames() throws Exception {
+		return this.modules.keySet().toArray(new String[modules.size()]);
+	}
+	
+	protected void removeServiceLog(MirroringModule module) throws Exception {
+		String sql_insert = String.format("delete from consumed_tx where service_name = '%s'", module.getName());
+		StatelessSession hibSession = DataSourceManager.getInstance().openStatelessSession(module.getDataSourceName());
+		try {
+			org.hibernate.Transaction transaction = hibSession.beginTransaction();
+			SQLQuery query = hibSession.createSQLQuery(sql_insert);
+			query.executeUpdate();
+			transaction.commit();
+		} catch (Exception e) {
+			throw e;
+		} finally {
+			hibSession.close();
+		}
+	}
+
+	protected void loadModules() {
+		File dir = new File(RDIAgent.RDI_DEPLOY_DIR);
+		File[] files = dir.listFiles(new FilenameFilter() {
+			public boolean accept(File dir, String name) {
+				return name.endsWith(".xml");
+			}
+		});
+
+		if (null == files || files.length == 0)
+			return;
+
+		for (File f : files) {
+			try {
+				this.modules.put(f.getName(), loadModule(f));
+			} catch (IOException e) {
+				// do nothing
+				logger.info("fail to load module " + f.getName(), e);
+			}
+		}
+	}
+
+	public static MirroringModule loadModule(File moduleFile) throws IOException {
+		return MirroringModule.fromXML(loadModuleAsString(moduleFile));
+	}
+
+	public String getProperty(String amoduleName, String key) {
+		String moduleName = amoduleName.endsWith(SERVICE_MODULE_FILE_EXT) ? amoduleName : amoduleName + SERVICE_MODULE_FILE_EXT;
+		MirroringModule module = this.modules.get(moduleName);
+		return module == null ? null : module.getProperty(key);
+
+	}
+
+	public static String loadModuleAsString(File moduleFile) throws IOException {
+		BufferedReader reader = new BufferedReader(new FileReader(moduleFile));
+		StringBuffer sb = new StringBuffer();
+		for (String line = reader.readLine(); line != null; line = reader.readLine()) {
+			sb.append(line);
+			sb.append("\n");
+		}
+		reader.close();
+		return sb.toString();
+
+	}
+	
+	private MirroringService[] getServicesByType(RDIServiceType type) {
+		java.util.Vector<MirroringService>  serviceList = new java.util.Vector<MirroringService>();
+		for (MirroringService s : this.mserviceMap.values()) {
+			if (type.equals(s.getServiceType())) {
+				serviceList.add(s);
+			}
+		}
+		return serviceList.toArray(new MirroringService[serviceList.size()]);
+	}
+
+	public void shutdown() throws Exception {
+		if (null != monitor)
+			monitor.stop();
+
+		this.scheduler.shutdown();
+		this.scheduler.awaitTermination(-1, TimeUnit.MILLISECONDS);
+		
+		MirroringService[] targetServiceList = getServicesByType(RDIServiceType.TARGET);
+		for (MirroringService s : targetServiceList) {
+			s.stop();
+		}
+		
+		MirroringService[] srcServiceList = getServicesByType(RDIServiceType.SOURCE);
+		for (MirroringService s : srcServiceList) {
+			s.stop();
+		}
+		
+		mserviceMap.clear();
+
+		this.planScheduler.shutdown();
+		this.planMap.clear();
+	}
+
+	@Override
+	public Set<String[]> getMatchedTablesByName(String amoduleName) throws Exception {
+		String moduleName = amoduleName.endsWith(SERVICE_MODULE_FILE_EXT) ? amoduleName : amoduleName + SERVICE_MODULE_FILE_EXT;
+		MirroringModule module = this.modules.get(moduleName);
+		return getMatchedTables(module);
+	}
+
+	@Override
+	public Set<String[]> getMatchedTables(String xml) throws Exception {
+		return getMatchedTables(MirroringModule.fromXML(xml));
+	}
+
+	private Set<String[]> getMatchedTables(MirroringModule module) throws Exception {
+		Set<String[]> tableSet = new HashSet<String[]>();
+		MirroringDescription[] xwcDess = module.getMirroringDescriptions(false);
+		for (MirroringDescription des : xwcDess)
+			tableSet.add(new String[] { des.getSrcUser(), des.getSrcObject(), des.getTargetUser(), des.getTargetObject() });
+
+		MirroringDescription[] wcDess = module.getMirroringDescriptions(true);
+		for (MirroringDescription des : wcDess) {
+			String srcUser = des.getSrcUser();
+			String srcTable = des.getSrcObject();
+			String[] tables = DataSourceManager.getInstance().getTables(module.getDataSourceName(), srcUser, null);
+			for (String table : tables) {
+				if (RegexUtil.sqlLikeMatch(table, srcTable))
+					tableSet.add(new String[] { srcUser, table, des.getTargetUser(), table });
+			}
+		}
+		// for (String[] s : tableSet) {
+		// System.out.println(s[0] + ":" + s[1]);
+		// }
+		return tableSet;
+	}
+
+	// for MS SQLSERVER
+	// private static final String ENABLE_CDC =
+	// "EXEC sys.sp_cdc_enable_table @source_schema = 'dbo', @source_name = '%s',@role_name = 'change_table_user1', @index_name = NULL, @capture_instance = 'ST_Instance', @supports_net_changes = 1, @captured_column_list = 'column_key, column_1, column_2', @filegroup_name = 'PRIMARY' ";
+	private static final String ENABLE_CDC = "EXEC sys.sp_cdc_enable_table @source_schema = '%s', @source_name = '%s',@role_name = '%s', @index_name = %s, @capture_instance = '%s', @supports_net_changes = %s, @captured_column_list = '%s', @filegroup_name = '%s' ";
+	private static final String DISABLE_CDC = "sys.sp_cdc_disable_table @source_schema = '%s', @source_name = '%s', @capture_instance = '%s'";
+
+	private static String formatENABLE_CDC(String source_schema, String source_name, String role_name, String index_name, String capture_instance, String supports_net_changes, String captured_column_list, String filegroup_name) {
+		return String.format(ENABLE_CDC, source_schema, source_name, role_name, index_name, capture_instance, supports_net_changes, captured_column_list, filegroup_name);
+	}
+
+	public static String captureName(String module, String table) {
+		return String.format("rdicapture_%s_%s", module, table);
+	}
+
+	private void disableCDC(MirroringModule module) throws Exception {
+		org.hibernate.StatelessSession session = DataSourceManager.getInstance().openStatelessSession(module.getDataSourceName());
+		PreparedStatement ps = null;
+		try {
+			for (MirroringDescription des : module.getMirroringDescriptions()) {
+				String user = des.getSrcUser();
+				String table = des.getSrcObject();
+				String cap_instance = captureName(module.getName(), table);
+				String ddl = String.format(DISABLE_CDC, user, table, cap_instance);
+				ps = session.connection().prepareStatement(ddl);
+				ps.executeUpdate();
+				session.connection().commit();
+			}
+		} catch (Exception e) {
+			throw e;
+		} finally {
+			if (null != ps)
+				ps.close();
+
+			session.close();
+		}
+
+	}
+
+	private void setupCDC(MirroringModule module) throws Exception {
+		org.hibernate.StatelessSession session = DataSourceManager.getInstance().openStatelessSession(module.getDataSourceName());
+		PreparedStatement ps = null;
+		try {
+			ps = session.connection().prepareStatement("EXECUTE sys.sp_cdc_enable_db");
+			ps.executeUpdate();
+			ps.close();
+			// query.executeUpdate();
+			// to named MirroringDescriptions
+			for (MirroringDescription des : module.getMirroringDescriptions()) {
+				String user = des.getSrcUser();
+				String table = des.getSrcObject();
+				String[] columns = DataSourceManager.getInstance().getColumnNames(module.getDataSourceName(), table, null);
+				StringBuffer columnList = new StringBuffer();
+				for (String col : columns) {
+					columnList.append(col).append(",");
+				}
+				columnList.setCharAt(columnList.length() - 1, ' ');
+				String enableCDC = formatENABLE_CDC(user, table, module.getName() + "_role", "NULL", captureName(module.getName(), table), "1", columnList.toString(), "PRIMARY");
+				ps = session.connection().prepareStatement(enableCDC);
+				ps.executeUpdate();
+				session.connection().commit();
+			}
+		} catch (Exception e) {
+			throw e;
+		} finally {
+			if (null != ps)
+				ps.close();
+
+			session.close();
+		}
+	}
+
+	public static void seed_md_filters(String agentID, String moduleName, MirroringModule mirroringModule) throws Exception {// or mapping
+		String sql = "insert into rdi_md_filters(AGENTID, MODULENAME, SEG_OWNER, SEG_NAME) values(?,?,?,?)";
+		org.hibernate.StatelessSession session = DataSourceManager.getInstance().openStatelessSession(mirroringModule.getDataSourceName());
+		org.hibernate.Transaction transaction = session.beginTransaction();
+		try {
+			for (MirroringDescription md : mirroringModule.getMirroringDescriptions()) {
+				SQLQuery query = session.createSQLQuery(sql);
+				query.setString(0, agentID);
+				query.setString(1, moduleName);
+				query.setString(2, md.getSrcUser());
+				query.setString(3, md.getSrcObject());
+				query.executeUpdate();
+			}
+			transaction.commit();
+		} catch (Exception e) {
+			logger.error("fail to seed_md_filters for " + moduleName, e);
+			throw e;
+		} finally {
+			if (null != session)
+				session.close();
+		}
+	}
+
+	public static void remove_md_filters(String agentID, String moduleName, String srcDataSourceName) throws Exception {
+		String rawsql = "delete from rdi_md_filters where AGENTID = '%s' and MODULENAME = '%s'";
+		org.hibernate.StatelessSession session = DataSourceManager.getInstance().openStatelessSession(srcDataSourceName);
+		org.hibernate.Transaction transaction = session.beginTransaction();
+		try {
+			String sql = String.format(rawsql, agentID, moduleName);
+			SQLQuery query = session.createSQLQuery(sql);
+			query.executeUpdate();
+			transaction.commit();
+		} catch (Exception e) {
+			logger.error("fail to remove rdi_md_filters for " + moduleName, e);
+			throw e;
+		} finally {
+			if (null != session)
+				session.close();
+		}
+	}
+	
+	public void purgeQueue(String name) throws Exception {
+		// think it over, this should be done by user manually
+		String moduleName = name.endsWith(SERVICE_MODULE_FILE_EXT) ? name : name + SERVICE_MODULE_FILE_EXT;
+		MirroringModule module = modules.get(moduleName);
+		if (null == module) {
+			throw new RuntimeException(String.format("module %s is deployed already", moduleName));
+		}
+		
+		String url = module.getProperty(MirroringModule.ASSOCIATED_MQ_URL);
+		String user = module.getProperty(MirroringModule.ASSOCIATED_MQ_USERNAME);
+		String password = module.getProperty(MirroringModule.ASSOCIATED_MQ_PASSWORD);
+		ConnectionFactory jmsConnectionFactory = new ActiveMQConnectionFactory(user, password, url);
+		
+		javax.jms.Connection connection = jmsConnectionFactory.createConnection();
+		javax.jms.Session session = connection.createSession(false, javax.jms.Session.AUTO_ACKNOWLEDGE);
+		javax.jms.MessageConsumer consumer = session.createConsumer(session.createQueue(moduleName));
+		connection.start();
+		while (true) {
+			javax.jms.Message msg = consumer.receive(1000);
+			if (null == msg) {
+				consumer.close();
+				session.close();
+				connection.close();
+				return;
+			}
+		}
+	}
+
+	public static void main(String[] args) {
+
+	}
+
+}

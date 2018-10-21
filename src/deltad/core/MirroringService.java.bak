@@ -1,0 +1,37 @@
+package rdi.common;
+
+import java.math.BigInteger;
+
+import rdi.common.description.MirroringModule;
+
+public interface MirroringService {
+//	public static final int SERVICE_TYPE_SOURCE = 0;
+//	public static final int SERVICE_TYPE_TARGET = 1;
+	
+	public void start(boolean clean) throws Exception;
+	public void stop() throws Exception;
+	public void suspend() throws Exception;
+	public String resume() throws Exception;
+	public String getBlockingTXAsString();
+	public TXRecoverInfo getBlockingTX();
+	public Exception getBlockingCause();
+	public void recover() throws Exception;
+	public ServiceState getState();
+	public String getstate();
+	public String getServiceName();
+	public MirroringModule getMirroringModule();
+	public String getMailConfigurationName();
+	public boolean isAutoRecover();
+	public boolean isSuspendOnException();
+	public DatabaseType getDatabaseType() throws Exception;
+	public void addMirroringDescription(String srcuser, String srcTable, String targerUser, String targetTable);
+	public void executeDMLUpdate(String sql) throws Exception;
+	public void executeDDL(String sql) throws Exception;
+	public String getProperty(String key);
+	public RDIServiceType getServiceType();
+	public Object[] getServiceSummary();
+	
+	public int getSourceBlockingQueueSize();
+	public BigInteger getDistanceBehind();
+
+}
